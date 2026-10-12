@@ -1,0 +1,4 @@
+change the bins to check
+take ac dc …. with constant voltage
+
+monitor the commande (check the oscillation

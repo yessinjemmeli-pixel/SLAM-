@@ -1,0 +1,4 @@
+float32 front_left_rpm
+float32 front_right_rpm
+float32 back_right_rpm
+float32 back_left_rpm
