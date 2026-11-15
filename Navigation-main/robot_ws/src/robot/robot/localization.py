@@ -3,13 +3,19 @@ from rclpy.node import Node
 from msgs.msg import Lidar, RPMs
 from std_msgs.msg import Empty
 from geometry_msgs.msg import Pose2D
-import math, time
+import math, time, os
 import numpy as np
+from nav_msgs.msg import OccupancyGrid
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy, QoSHistoryPolicy
 import open3d as o3d
 from robot.robot_config import (WHEEL_RADIUS, LX, LY, LIDAR_MIN_DIST, LIDAR_MAX_RANGE_M, LOC_DIST_THRESHOLD,
                                 LOC_ANGLE_THRESHOLD, angle_wrap, ICP_MAX_CORRESPOND_DIST, ICP_MAX_JUMP_DIST,
                                 ICP_MAX_JUMP_ANGLE, ICP_VOXEL_SIZE, ICP_FITNESS_THRESHOLD, ICP_INLIER_RMSE_THRESHOLD,
-                                ICP_MAP_UPDATE_FITNESS, ICP_MIN_POINTS, ENCODER_NOISE_THRESHOLD)
+                                ICP_MAP_UPDATE_FITNESS, ICP_MIN_POINTS, ENCODER_NOISE_THRESHOLD,
+                                GRID_RESOLUTION, GRID_SIZE_M, GRID_LOGODDS_OCC, GRID_LOGODDS_FREE,
+                                GRID_LOGODDS_MIN, GRID_LOGODDS_MAX, GRID_PUBLISH_PERIOD, GRID_MAX_OMEGA,
+                                GRID_SAVE_DIR)
+from robot.occupancy_grid import OccupancyGridMap
 
 class LocalizationNode(Node):
 
@@ -37,7 +43,21 @@ class LocalizationNode(Node):
         self.create_subscription(Lidar, '/robot/lidar', self.lidar_callback, 1)
         self.create_subscription(Empty, '/robot/reset_pos', self.reset, 1)
         self.pub_pos = self.create_publisher(Pose2D, '/robot/pos', 10)
-        self.get_logger().info("Noeud Localisation démarré (open3d ICP)")
+
+        # -- Grille d'occupation (carte de la session en cours, perdue a l'arret du programme) --
+        self.grid = OccupancyGridMap(GRID_RESOLUTION, GRID_SIZE_M, GRID_LOGODDS_OCC, GRID_LOGODDS_FREE,
+                                     GRID_LOGODDS_MIN, GRID_LOGODDS_MAX)
+        # TRANSIENT_LOCAL : un visualiseur lance apres coup recoit tout de suite la derniere carte
+        map_qos = QoSProfile(reliability=QoSReliabilityPolicy.RELIABLE,
+                             durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                             history=QoSHistoryPolicy.KEEP_LAST, depth=1)
+        self.pub_map = self.create_publisher(OccupancyGrid, '/robot/map', map_qos)
+        self.create_subscription(Empty, '/robot/save_map', self.save_map, 1)
+        self._grid_prev_theta = None
+        self._grid_prev_time = None
+        self._grid_last_pub = 0.0
+        self._grid_skipped = 0
+        self.get_logger().info("Noeud Localisation démarré (open3d ICP + grille d'occupation)")
 
     #  ENCODEURS
 
@@ -105,6 +125,7 @@ class LocalizationNode(Node):
         # Premier scan : on l'enregistre comme référence, pas de correction possible
         if self.ref_pcd is None or len(self.ref_pcd.points) < 30:
             self.ref_pcd = curr_pcd
+            self._update_grid(msg)
             return
 
         # ICP : aligner le scan courant sur le scan de référence
@@ -178,6 +199,7 @@ class LocalizationNode(Node):
         self.y = new_y
         self.theta = new_theta
         self._publish()
+        self._update_grid(msg)
 
         self.get_logger().debug(
             f"ICP OK  fitness={result.fitness:.2f}  "
@@ -216,6 +238,62 @@ class LocalizationNode(Node):
             self.get_logger().info(f"CARTE MISE À JOUR ! Taille du nuage: {len(self.ref_pcd.points)} points")
 
         self._publish()
+
+    #  GRILLE D'OCCUPATION
+
+    def _update_grid(self, msg: Lidar):
+        """Integre le scan dans la grille avec la pose fusionnee, puis publie la carte periodiquement.
+        Entoure de try/except : un bug de cartographie ne doit jamais casser la localisation."""
+        try:
+            now = time.monotonic()
+            # Le C1 tourne a ~10 Hz et le scan est deforme si le robot tourne vite (pas de deskewing).
+            # On estime la vitesse de rotation entre deux scans et on saute les scans trop deformes.
+            skip = False
+            if GRID_MAX_OMEGA > 0 and self._grid_prev_time is not None:
+                dt = now - self._grid_prev_time
+                if dt > 1e-3:
+                    omega = abs(angle_wrap(self.theta - self._grid_prev_theta)) / dt
+                    skip = omega > GRID_MAX_OMEGA
+            self._grid_prev_theta = self.theta
+            self._grid_prev_time = now
+            if skip:
+                self._grid_skipped += 1
+            else:
+                self.grid.update(self.x, self.y, self.theta, msg.angles, msg.distances,
+                                 LIDAR_MIN_DIST, LIDAR_MAX_RANGE_M - 0.05)
+            if now - self._grid_last_pub >= GRID_PUBLISH_PERIOD:
+                self._grid_last_pub = now
+                self._publish_grid()
+        except Exception as e:
+            self.get_logger().error(f"Erreur grille d'occupation : {e}")
+
+    def _publish_grid(self):
+        exported = self.grid.export_ros()
+        if exported is None:
+            return
+        data, w, h, ox, oy = exported
+        m = OccupancyGrid()
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.header.frame_id = 'map'
+        m.info.resolution = float(self.grid.resolution)
+        m.info.width = int(w)
+        m.info.height = int(h)
+        m.info.origin.position.x = float(ox)
+        m.info.origin.position.y = float(oy)
+        m.info.origin.orientation.w = 1.0
+        m.data = data
+        self.pub_map.publish(m)
+
+    def save_map(self, msg: Empty):
+        try:
+            res = self.grid.save(os.path.expanduser(GRID_SAVE_DIR))
+        except Exception as e:
+            self.get_logger().error(f"Sauvegarde de la carte impossible : {e}")
+            return
+        if res is None:
+            self.get_logger().warn("Carte vide : rien à sauvegarder")
+        else:
+            self.get_logger().info(f"Carte sauvegardée : {res[0]} (scans sautés car rotation trop rapide : {self._grid_skipped})")
 
     #  UTILITAIRES
     def _scan_to_global_pcd(self, msg: Lidar) -> o3d.geometry.PointCloud:
@@ -258,6 +336,12 @@ class LocalizationNode(Node):
         self.last_ref_x = 0.0
         self.last_ref_y = 0.0
         self.last_ref_theta = 0.0
+
+        # La carte repart de zero (le nouveau repere est la pose actuelle)
+        self.grid.reset()
+        self._grid_prev_theta = None
+        self._grid_prev_time = None
+        self._grid_skipped = 0
     #@staticmethod
     #def angle_wrap(a: float) -> float:
     #return (a + math.pi) % (2 * math.pi) - math.pi

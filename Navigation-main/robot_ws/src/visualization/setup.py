@@ -24,6 +24,7 @@ setup(
             'lidar = visualization.lidar_visualizer:main',
             'asserv = visualization.asserv_visualizer:main',
             'position = visualization.pos_visualizer:main',
+            'map = visualization.map_visualizer:main',
         ],
     },
 )
